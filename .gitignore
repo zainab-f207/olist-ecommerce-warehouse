@@ -1,0 +1,33 @@
+# Python virtual environments and cache
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Airflow generated files
+airflow/logs/*
+!airflow/logs/.gitkeep
+airflow/config/*
+!airflow/config/.gitkeep
+airflow/plugins/*
+!airflow/plugins/.gitkeep
+
+# dbt generated files and logs
+olist_warehouse/target/
+olist_warehouse/logs/
+olist_warehouse/.user.yml
+
+# Source data and generated files
+data/
+*.parquet
+*.db
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/

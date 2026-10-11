@@ -1,0 +1,14 @@
+version: 2
+
+sources:
+  - name: public
+    schema: public
+    tables:
+      - name: staging_customers
+      - name: staging_orders
+      - name: staging_order_items
+      - name: staging_order_payments
+      - name: staging_order_reviews
+      - name: staging_products
+      - name: staging_sellers
+      - name: staging_category_translation
