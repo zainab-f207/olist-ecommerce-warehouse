@@ -1,132 +1,199 @@
 # Olist E-commerce Data Warehouse
 
-An end-to-end data engineering project that loads Brazilian Olist e-commerce CSV data into PostgreSQL, transforms it using dbt, and orchestrates the pipeline with Apache Airflow and Docker.
+An end-to-end data engineering project. It loads the public **Olist Brazilian e-commerce dataset** (about 100,000 orders, 2016 to 2018) into PostgreSQL, models it as a **star-schema warehouse with dbt**, checks it with **32 automated tests**, and runs the whole pipeline on **Airflow in Docker**, started with a single `docker compose up`.
 
-## Technologies
+## Architecture
 
-- Python and pandas
-- PostgreSQL
-- Apache Airflow 2.10.4
-- dbt Core with the PostgreSQL adapter
-- Docker and Docker Compose
-- Git and GitHub
+```mermaid
+flowchart LR
+    A[Olist CSV files] --> B[load_staging]
+    subgraph Airflow[Airflow DAG: olist_warehouse_pipeline]
+        B --> D[dbt_run] --> F[dbt_test]
+    end
+    B -->|writes| C[(Staging tables)]
+    D -->|builds| E[(Dimensions and facts)]
+    F -->|checks| E
+```
 
-## Project Architecture
+| Step | What it does | Tool |
+|---|---|---|
+| Load | Reads 8 CSVs into staging tables | Python, pandas, SQLAlchemy |
+| Transform | Builds dimensions and facts | dbt Core |
+| Test | 32 data-quality tests | dbt tests |
+| Orchestrate | Runs the steps in order, stops on failure | Airflow 2.10.4 |
+| Package | Everything runs with one command | Docker Compose |
 
-1. **Data source:** Olist e-commerce CSV files.
-2. **Data loading:** `load_staging.py` loads the CSV files into PostgreSQL staging tables.
-3. **Data transformation:** dbt builds staging models, dimension tables, and fact tables.
-4. **Orchestration:** Airflow runs the loading, transformation, and testing tasks in order.
-5. **Data quality:** dbt runs data tests to check null values, uniqueness, accepted values, and relationships.
+## Data model
 
-## Project Structure
+```mermaid
+erDiagram
+    dim_customers ||--o{ fact_orders : places
+    dim_customers ||--o{ fact_order_items : buys
+    dim_products ||--o{ fact_order_items : sold_as
+    dim_sellers ||--o{ fact_order_items : sold_by
+    dim_date ||--o{ fact_orders : dated
+    dim_date ||--o{ fact_order_items : dated
+    fact_orders ||--o{ fact_order_items : contains
+    fact_orders ||--o{ fact_order_payments : paid_by
+    fact_orders ||--o{ fact_order_reviews : reviewed_in
+```
+
+| Fact table | Grain (one row is...) |
+|---|---|
+| `fact_orders` | one order |
+| `fact_order_items` | one product line within an order |
+| `fact_order_payments` | one payment transaction |
+| `fact_order_reviews` | one review |
+
+## Design decisions
+
+- **Four fact tables**, because the grains differ. Mixing them in one table would multiply rows and inflate sums.
+- **`fact_order_items` carries `customer_key` and `purchase_date_key` directly**, so common questions need fewer joins.
+- **LEFT JOINs plus row-count reconciliation.** An INNER JOIN silently drops rows, so every fact is reconciled against staging.
+- **Reviews use a surrogate key**, because `review_id` is not unique in the source data.
+- **`date_key` is `YYYYMMDD`** (an integer that is readable and sortable).
+- **`delivery_delay_days` = delivered minus estimated.** Negative means early, NULL means not delivered.
+- **`TRUNCATE` inside one transaction** instead of replacing tables, so a failed load never leaves empty tables.
+- **`schedule=None`**, because the dataset is a static snapshot. Runs are triggered manually.
+- **No task retries.** A failure in a deterministic pipeline should be seen, not hidden.
+- **dbt runs in its own virtualenv** inside the Airflow image, to avoid dependency conflicts.
+- **No secrets in the repo.** Passwords come from environment variables (`.env` is git-ignored).
+
+## Validation
+
+`dbt test`: **32 passed, 0 warnings, 0 errors.** The pipeline has run successfully three times end to end.
+
+- `unique` and `not_null` on every key
+- `relationships` on every foreign key (paired with `not_null`, because `relationships` ignores NULLs)
+- `accepted_values` on `review_score` (1 to 5)
+- Surrogate-key tests pass by construction, so they guard against regressions rather than prove correctness.
+
+Row counts reconciled against staging:
+
+| Table | Rows |
+|---|---|
+| orders | 99,441 |
+| order items | 112,650 |
+| payments | 103,886 |
+| reviews | 99,224 |
+
+## Example analysis
+
+### Monthly revenue (BRL)
+
+```sql
+SELECT d.year, d.month, ROUND(SUM(f.price)::numeric, 2) AS revenue
+FROM fact_order_items f
+JOIN dim_date d ON f.purchase_date_key = d.date_key
+GROUP BY d.year, d.month
+ORDER BY d.year, d.month;
+```
+
+<details>
+<summary>Full results (24 months)</summary>
+
+| Month | Revenue |
+|---|---:|
+| 2016-09 | 267.36 |
+| 2016-10 | 49,507.66 |
+| 2016-12 | 10.90 |
+| 2017-01 | 120,312.87 |
+| 2017-02 | 247,303.02 |
+| 2017-03 | 374,344.30 |
+| 2017-04 | 359,927.23 |
+| 2017-05 | 506,071.14 |
+| 2017-06 | 433,038.60 |
+| 2017-07 | 498,031.48 |
+| 2017-08 | 573,971.68 |
+| 2017-09 | 624,401.69 |
+| 2017-10 | 664,219.43 |
+| 2017-11 | 1,010,271.37 |
+| 2017-12 | 743,914.17 |
+| 2018-01 | 950,030.36 |
+| 2018-02 | 844,178.71 |
+| 2018-03 | 983,213.44 |
+| 2018-04 | 996,647.75 |
+| 2018-05 | 996,517.68 |
+| 2018-06 | 865,124.31 |
+| 2018-07 | 895,507.22 |
+| 2018-08 | 854,686.33 |
+| 2018-09 | 145.00 |
+
+</details>
+
+- **November 2017 peaks at about 1.01M BRL**, most likely Black Friday.
+- **2018 plateaus at roughly 0.85 to 1.0M BRL per month.**
+- **The edge months (2016-09/12, 2018-09) are dataset boundaries, not collapses.** There is no data at all for November 2016.
+
+### Delivery performance by state (top 10 by % late)
+
+| State | Delivered orders | Avg days vs estimate | % late |
+|---|---:|---:|---:|
+| AL | 397 | -8.7 | 21.4 |
+| MA | 717 | -9.6 | 17.4 |
+| SE | 335 | -10.0 | 15.2 |
+| PI | 476 | -11.3 | 13.9 |
+| CE | 1,279 | -10.8 | 13.8 |
+| RR | 41 | -17.3 | 12.2 |
+| BA | 3,256 | -10.8 | 12.2 |
+| RJ | 12,353 | -11.8 | 12.1 |
+| PA | 946 | -14.1 | 11.2 |
+| ES | 1,995 | -10.5 | 10.7 |
+
+- All averages are negative: Olist's delivery estimates are conservative, so most orders arrive early.
+- 6 of the 10 worst states are in the Northeast.
+- RR has only 41 orders, so its figure is unreliable.
+- RJ has by far the largest volume, so its 12.1% late rate affects the most customers.
+
+## Screenshots
+
+![Airflow DAG run](docs/images/airflow-graph.png)
+
+## Run it yourself
+
+1. Clone this repo.
+2. Download the dataset from [Kaggle](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) and put the 8 CSV files in `data/` (the geolocation file is unused).
+3. Copy `airflow/.env.example` to `airflow/.env` and set a password.
+4. Start everything:
+   ```bash
+   cd airflow
+   docker compose up -d --build
+   ```
+5. Open http://localhost:8080 (user `airflow`, password `airflow`). The DAG starts **paused**: turn it on, then trigger it.
+6. Verify:
+   ```bash
+   docker exec -it olist_warehouse_db psql -U postgres -d postgres -c "SELECT COUNT(*) FROM fact_order_items"
+   ```
+   It should return `112650`.
+
+## Project structure
 
 ```text
 olist-ecommerce-warehouse/
-├── airflow/
-│   ├── dags/
-│   │   └── olist_pipeline.py
-│   ├── Dockerfile
-│   ├── docker-compose.yaml
-│   └── .env.example
-├── data/                       # Local CSV files; not committed
-├── load_staging.py
-├── olist_warehouse/
-│   ├── models/
-│   │   ├── staging/
-│   │   └── marts/
-│   ├── dbt_project.yml
-│   └── profiles.yml
-├── .gitignore
-└── README.md
+  load_staging.py          # CSV -> staging tables
+  olist_warehouse/         # dbt project
+    models/staging/        # 7 cleaned views + sources.yml
+    models/marts/          # dimensions, facts, schema.yml (32 tests)
+    profiles.yml           # reads credentials from env vars
+  airflow/
+    Dockerfile             # Airflow + dbt in its own venv
+    docker-compose.yaml    # Airflow + warehouse Postgres
+    dags/olist_pipeline.py # load_staging >> dbt_run >> dbt_test
+    .env.example
+  data/                    # git-ignored, put the CSVs here
+  docs/images/             # screenshots
 ```
 
-## Pipeline Tasks
+## Known limitations and next steps
 
-The Airflow DAG is named `olist_warehouse_pipeline` and runs three tasks in order:
+- All models are views. Large tables would be materialized as tables or incrementally.
+- Each run is a full reload. An incremental load is the natural next step.
+- `dim_customers` is per `customer_id`, not per person (`customer_unique_id`).
+- Geolocation data is not modelled.
+- No CI yet (planned: run `dbt test` on every push with GitHub Actions).
 
-1. `load_staging` — loads CSV data into PostgreSQL.
-2. `dbt_run` — builds the dbt data models.
-3. `dbt_test` — executes the dbt data quality tests.
+## Data attribution
 
-## Data Warehouse Models
+Data: [Brazilian E-Commerce Public Dataset by Olist](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) on Kaggle. Check the license on that page before reuse. The dataset is not included in this repo.
 
-The project includes staging models and analytical models such as:
-
-- Dimensions: customers, products, sellers, and dates.
-- Fact tables: orders, order items, payments, and reviews.
-
-## Validation Results
-
-The pipeline has completed successfully twice in the new Docker setup.
-
-Latest recorded dbt test result:
-
-- Passed: 32
-- Warnings in data tests: 0
-- Errors: 0
-- Skipped: 0
-
-## Local Setup
-
-### Prerequisites
-
-- Docker Desktop
-- Git
-- The Olist e-commerce dataset CSV files
-- A PostgreSQL database for the Olist staging tables
-
-### 1. Clone the repository
-
-```bash
-git clone https://github.com/zainab-f207/olist-ecommerce-warehouse.git
-cd olist-ecommerce-warehouse
-```
-
-### 2. Add the dataset
-
-Create the `data/` directory and place these eight CSV files inside it:
-
-- `olist_customers_dataset.csv`
-- `olist_orders_dataset.csv`
-- `olist_order_items_dataset.csv`
-- `olist_order_payments_dataset.csv`
-- `olist_order_reviews_dataset.csv`
-- `olist_products_dataset.csv`
-- `olist_sellers_dataset.csv`
-- `product_category_name_translation.csv`
-
-The dataset is not included in this repository.
-
-### 3. Configure environment variables
-
-Copy `airflow/.env.example` to `airflow/.env` and set your own database and Airflow credentials. Never commit the real `.env` file.
-
-### 4. Prepare the PostgreSQL database
-
-Make sure your PostgreSQL database is running and accessible to the Airflow containers. The existing Olist database container must be reachable using the hostname `de_postgres` on the Docker network.
-
-The loader uses these environment variables:
-
-- `PG_HOST`
-- `PG_USER`
-- `PG_PASSWORD`
-
-### 5. Start Airflow
-
-Open a terminal in the `airflow/` directory and run:
-
-```bash
-docker compose up -d --build
-```
-
-Wait for the Airflow services to initialize. Then open `http://localhost:8080` in your browser and sign in using your configured Airflow credentials.
-
-Trigger the `olist_warehouse_pipeline` DAG and confirm that `load_staging`, `dbt_run`, and `dbt_test` succeed.
-
-**Note:** Ensure the existing `de_postgres` container is connected to the `olist_airflow_default` Docker network before running the pipeline.
-
-### 6. Check data quality
-
-The dbt test suite checks data quality and relationships between warehouse models. In the latest successful run, all 32 tests passed without warnings or errors.
-
+Built by Zainab.
